@@ -25,7 +25,7 @@ jobs:
       - name: Install Android packages
         shell: bash
         run: |
-          yes | sdkmanager --licenses
+          yes | sdkmanager --licenses || true
           sdkmanager --install \
             "platform-tools" \
             "platforms;android-34" \
