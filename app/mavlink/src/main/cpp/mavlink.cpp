@@ -24,6 +24,8 @@
 #include <thread>
 #include <assert.h>
 #include <android/log.h>
+#include <mutex>
+#include <vector>
 
 #include "mavlink/common/mavlink.h"
 #include "mavlink.h"
@@ -56,6 +58,13 @@ long distance_meters_between(double lat1, double lon1, double lat2, double lon2)
 
 int mavlink_thread_signal = 0;
 std::atomic<bool> latestMavlinkDataChange = false;
+std::mutex forwardConfigMutex;
+bool forwardEnabled = false;
+std::vector<sockaddr_in> forwardTargets;
+std::mutex rawForwarderMutex;
+jobject rawForwarder = nullptr;
+jmethodID rawForwarderMethod = nullptr;
+JavaVM *g_vm = nullptr;
 
 void *listen(int mavlink_port) {
     __android_log_print(ANDROID_LOG_DEBUG, TAG, "Starting mavlink thread...");
@@ -65,6 +74,12 @@ void *listen(int mavlink_port) {
         __android_log_print(ANDROID_LOG_DEBUG, TAG,
                             "ERROR: Unable to create MavLink socket:  %s", strerror(errno));
         return 0;
+    }
+
+    int broadcast = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast)) < 0) {
+        __android_log_print(ANDROID_LOG_WARN, TAG, "Unable to enable broadcast: %s",
+                            strerror(errno));
     }
 
     // Bind port
@@ -111,6 +126,58 @@ void *listen(int mavlink_port) {
         }
 
         // Parse
+        std::vector<sockaddr_in> targetsCopy;
+        {
+            std::lock_guard<std::mutex> lock(forwardConfigMutex);
+            if (forwardEnabled) {
+                targetsCopy = forwardTargets;
+            }
+        }
+        if (!targetsCopy.empty()) {
+            for (auto &destination : targetsCopy) {
+                ssize_t sent = sendto(fd, buffer, ret, 0,
+                                      reinterpret_cast<sockaddr *>(&destination), sizeof(destination));
+                if (sent < 0) {
+                    __android_log_print(ANDROID_LOG_ERROR, TAG,
+                                        "Failed to forward MAVLink: %s", strerror(errno));
+                }
+            }
+        }
+
+        bool hasRawForwarder = false;
+        {
+            std::lock_guard<std::mutex> lock(rawForwarderMutex);
+            hasRawForwarder = rawForwarder != nullptr && rawForwarderMethod != nullptr;
+        }
+
+        if (hasRawForwarder) {
+            JNIEnv *env = nullptr;
+            bool attached = false;
+            if (g_vm != nullptr) {
+                if (g_vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6) != JNI_OK) {
+                    if (g_vm->AttachCurrentThread(&env, nullptr) == JNI_OK) {
+                        attached = true;
+                    } else {
+                        env = nullptr;
+                    }
+                }
+            }
+            if (env != nullptr) {
+                jbyteArray rawArray = env->NewByteArray(ret);
+                if (rawArray != nullptr) {
+                    env->SetByteArrayRegion(rawArray, 0, ret, reinterpret_cast<jbyte *>(buffer));
+                    std::lock_guard<std::mutex> lock(rawForwarderMutex);
+                    if (rawForwarder != nullptr && rawForwarderMethod != nullptr) {
+                        env->CallVoidMethod(rawForwarder, rawForwarderMethod, rawArray, ret);
+                    }
+                    env->DeleteLocalRef(rawArray);
+                }
+            }
+            if (attached && g_vm != nullptr) {
+                g_vm->DetachCurrentThread();
+            }
+        }
+
         mavlink_message_t msgMav;
         mavlink_status_t status;
         uint32_t tmp32;
@@ -372,6 +439,93 @@ Java_com_openipc_mavlink_MavlinkNative_nativeCallBack(JNIEnv *env, jclass clazz,
         env->DeleteLocalRef(pJstring);
     }
 }
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_com_openipc_mavlink_MavlinkNative_nativeConfigureForward(JNIEnv *env, jclass clazz,
+                                                              jobjectArray targetIps,
+                                                              jintArray targetPorts,
+                                                              jboolean enabled) {
+    std::lock_guard<std::mutex> lock(forwardConfigMutex);
+    forwardEnabled = enabled == JNI_TRUE;
+    forwardTargets.clear();
+
+    if (!forwardEnabled) {
+        return;
+    }
+
+    if (targetIps == nullptr || targetPorts == nullptr) {
+        forwardEnabled = false;
+        return;
+    }
+
+    jsize ipCount = env->GetArrayLength(targetIps);
+    jsize portCount = env->GetArrayLength(targetPorts);
+
+    if (ipCount == 0 || ipCount != portCount) {
+        forwardEnabled = false;
+        return;
+    }
+
+    jint *ports = env->GetIntArrayElements(targetPorts, nullptr);
+    if (ports == nullptr) {
+        forwardEnabled = false;
+        return;
+    }
+
+    for (jsize i = 0; i < ipCount; ++i) {
+        auto ipValue = (jstring) env->GetObjectArrayElement(targetIps, i);
+        if (ipValue == nullptr) {
+            env->DeleteLocalRef(ipValue);
+            continue;
+        }
+
+        const char *ipChars = env->GetStringUTFChars(ipValue, nullptr);
+        if (ipChars != nullptr && strlen(ipChars) > 0) {
+            sockaddr_in addr = {};
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons(static_cast<uint16_t>(ports[i]));
+            if (inet_pton(AF_INET, ipChars, &addr.sin_addr) == 1) {
+                forwardTargets.push_back(addr);
+            } else {
+                __android_log_print(ANDROID_LOG_ERROR, TAG, "Invalid MAVLink forward IP: %s",
+                                    ipChars);
+            }
+        }
+
+        if (ipChars != nullptr) {
+            env->ReleaseStringUTFChars(ipValue, ipChars);
+        }
+        env->DeleteLocalRef(ipValue);
+    }
+
+    env->ReleaseIntArrayElements(targetPorts, ports, JNI_ABORT);
+    forwardEnabled = !forwardTargets.empty();
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_com_openipc_mavlink_MavlinkNative_nativeSetRawForwarder(JNIEnv *env, jclass clazz,
+                                                             jobject forwarder) {
+    std::lock_guard<std::mutex> lock(rawForwarderMutex);
+    if (rawForwarder != nullptr) {
+        env->DeleteGlobalRef(rawForwarder);
+        rawForwarder = nullptr;
+        rawForwarderMethod = nullptr;
+    }
+    if (forwarder != nullptr) {
+        rawForwarder = env->NewGlobalRef(forwarder);
+        jclass forwarderClass = env->GetObjectClass(forwarder);
+        rawForwarderMethod = env->GetMethodID(forwarderClass, "onMavlinkRaw", "([BI)V");
+        env->DeleteLocalRef(forwarderClass);
+    }
+}
+
+JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
+    g_vm = vm;
+    return JNI_VERSION_1_6;
+}
+
 extern "C"
 JNIEXPORT void JNICALL
 Java_com_openipc_mavlink_MavlinkNative_nativeStart(JNIEnv *env, jclass clazz, jobject context) {

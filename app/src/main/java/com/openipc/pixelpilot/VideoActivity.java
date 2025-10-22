@@ -1,18 +1,27 @@
 package com.openipc.pixelpilot;
 
+import android.Manifest;
 import android.annotation.SuppressLint;
 import android.app.Dialog;
+import android.bluetooth.BluetoothAdapter;
+import android.bluetooth.BluetoothDevice;
+import android.bluetooth.le.BluetoothLeScanner;
+import android.bluetooth.le.ScanCallback;
+import android.bluetooth.le.ScanFilter;
+import android.bluetooth.le.ScanResult;
+import android.bluetooth.le.ScanSettings;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.content.UriPermission;
 import android.content.pm.PackageInfo;
-import android.content.pm.PackageManager;
 import android.content.res.ColorStateList;
 import android.graphics.Color;
 import android.hardware.usb.UsbManager;
+import android.net.DhcpInfo;
 import android.net.Uri;
 import android.net.VpnService;
 import android.net.wifi.WifiManager;
@@ -22,7 +31,9 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.ParcelFileDescriptor;
+import android.os.ParcelUuid;
 import android.text.format.Formatter;
+import android.text.TextUtils;
 import android.util.Base64;
 import android.util.DisplayMetrics;
 import android.util.Log;
@@ -37,11 +48,17 @@ import android.webkit.WebViewClient;
 import android.widget.PopupMenu;
 import android.widget.SeekBar;
 import android.widget.Toast;
+import android.widget.ArrayAdapter;
+import android.widget.ListView;
+import android.widget.EditText;
 
+import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.appcompat.app.AlertDialog;
 import androidx.constraintlayout.widget.ConstraintLayout;
 import androidx.constraintlayout.widget.ConstraintSet;
+import androidx.core.app.ActivityCompat;
 import androidx.core.content.FileProvider;
 import androidx.documentfile.provider.DocumentFile;
 
@@ -56,6 +73,7 @@ import com.openipc.mavlink.MavlinkUpdate;
 import com.openipc.pixelpilot.databinding.ActivityVideoBinding;
 import com.openipc.pixelpilot.osd.OSDElement;
 import com.openipc.pixelpilot.osd.OSDManager;
+import com.openipc.pixelpilot.bluetooth.BluetoothForwarder;
 import com.openipc.videonative.DecodingInfo;
 import com.openipc.videonative.IVideoParamsChanged;
 import com.openipc.videonative.VideoPlayer;
@@ -78,16 +96,20 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.Locale;
+import java.util.Collections;
+import java.util.List;
+import java.util.Set;
 import java.util.Timer;
 import java.util.TimerTask;
 
 // Most basic implementation of an activity that uses VideoNative to stream a video
 // Into an Android Surface View
 public class VideoActivity extends AppCompatActivity implements IVideoParamsChanged,
-        WfbNGStatsChanged, MavlinkUpdate, SettingsChanged {
+        WfbNGStatsChanged, MavlinkUpdate, SettingsChanged, BluetoothForwarder.Listener {
     private static final String TAG = "pixelpilot";
     private static final int PICK_KEY_REQUEST_CODE = 1;
     private static final int PICK_DVR_REQUEST_CODE = 2;
+    private static final int REQUEST_BLUETOOTH_PERMISSION = 2001;
     private static WifiManager wifiManager;
     final Handler handler = new Handler(Looper.getMainLooper());
     final Runnable runnable = new Runnable() {
@@ -111,6 +133,11 @@ public class VideoActivity extends AppCompatActivity implements IVideoParamsChan
     private ConstraintLayout constraintLayout;
     private ConstraintSet constraintSet;
     private WfbNgLink wfbLink;
+    private BluetoothForwarder bluetoothForwarder;
+    private boolean pendingBluetoothPermission = false;
+    private boolean bluetoothConnected = false;
+    private String bluetoothConnectedName = "";
+    private boolean bluetoothConnectedIsBle = false;
 
     public boolean getVRSetting() {
         return getSharedPreferences("general", Context.MODE_PRIVATE).getBoolean("vr-mode", false);
@@ -263,6 +290,9 @@ public class VideoActivity extends AppCompatActivity implements IVideoParamsChan
         // Button Handlers
         setupButtonHandlers();
 
+        // Bluetooth Forwarder
+        initializeBluetoothForwarder();
+
         // Mavlink Setup
         setupMavlink();
 
@@ -342,6 +372,10 @@ public class VideoActivity extends AppCompatActivity implements IVideoParamsChan
         binding.surfaceViewRight.setVisibility(View.GONE);
         binding.surfaceViewLeft.setVisibility(View.GONE);
         binding.mainVideo.getHolder().addCallback(videoPlayer.configure1(0));
+    }
+
+    private void initializeBluetoothForwarder() {
+        bluetoothForwarder = new BluetoothForwarder(this, this);
     }
 
     // ----------------------------------------------------------------------------
@@ -562,6 +596,9 @@ public class VideoActivity extends AppCompatActivity implements IVideoParamsChan
 
         // Recording submenu
         setupRecordingSubMenu(popup);
+
+        // MAVLink submenu
+        setupMavlinkSubMenu(popup);
 
         // Drone submenu
         setupDroneSubMenu(popup);
@@ -879,6 +916,108 @@ public class VideoActivity extends AppCompatActivity implements IVideoParamsChan
     }
 
     /**
+     * Submenu for configuring MAVLink UDP forwarding.
+     */
+    private void setupMavlinkSubMenu(PopupMenu popup) {
+        SubMenu mavlinkMenu = popup.getMenu().addSubMenu("MAVLink");
+        SharedPreferences prefs = getSharedPreferences("general", MODE_PRIVATE);
+        boolean bluetoothEnabled = prefs.getBoolean("mavlink_forward_bt_enabled", false);
+
+        // UDP 转发暂时禁用：隐藏/移除 UDP 相关菜单项，仅保留蓝牙相关配置
+        mavlinkMenu.setHeaderTitle("UDP forwarding is temporarily disabled; use Bluetooth");
+
+        // BLE-only 模式：忽略首选项，强制使用 BLE
+
+        MenuItem btToggle = mavlinkMenu.add("启用蓝牙转发");
+        btToggle.setCheckable(true);
+        btToggle.setChecked(bluetoothEnabled);
+        btToggle.setOnMenuItemClickListener(item -> {
+            boolean newState = !item.isChecked();
+            item.setChecked(newState);
+            SharedPreferences.Editor editor = prefs.edit();
+            editor.putBoolean("mavlink_forward_bt_enabled", newState);
+            editor.apply();
+            if (newState) {
+                if (ensureBluetoothPermission()) {
+                    applyBluetoothForwardingFromPrefs();
+                }
+            } else {
+                stopBluetoothForwarding();
+            }
+            return true;
+        });
+
+        // 连接仅使用 BLE，不提供回退开关
+
+        MenuItem btSelect = mavlinkMenu.add("Select Bluetooth device (BLE only)...");
+        btSelect.setOnMenuItemClickListener(item -> {
+            if (ensureBluetoothPermission()) {
+                showBluetoothDeviceDialog();
+            }
+            return true;
+        });
+
+        String btStatusText;
+        if (!bluetoothEnabled) {
+            btStatusText = "Bluetooth: 未启用";
+        } else if (bluetoothConnected) {
+            String name = !TextUtils.isEmpty(bluetoothConnectedName) ? bluetoothConnectedName : "已连接";
+            btStatusText = "Bluetooth: 已连接 (" + (bluetoothConnectedIsBle ? "BLE" : "SPP") + ") " + name;
+        } else {
+            btStatusText = "Bluetooth: 等待连接";
+        }
+        mavlinkMenu.add(btStatusText).setEnabled(false);
+    }
+
+    private void showMavlinkForwardDialog() {
+        SharedPreferences prefs = getSharedPreferences("general", MODE_PRIVATE);
+        String ip = prefs.getString("mavlink_forward_ip", "");
+        int port = prefs.getInt("mavlink_forward_port", 14550);
+
+        android.widget.LinearLayout layout = new android.widget.LinearLayout(this);
+        layout.setOrientation(android.widget.LinearLayout.VERTICAL);
+        int padding = (int) (16 * getResources().getDisplayMetrics().density);
+        layout.setPadding(padding, padding, padding, padding);
+
+        android.widget.EditText ipEdit = new android.widget.EditText(this);
+        ipEdit.setHint("IP (e.g. 192.168.43.10)");
+        ipEdit.setInputType(android.text.InputType.TYPE_CLASS_PHONE);
+        if (ip != null) {
+            ipEdit.setText(ip);
+        }
+        layout.addView(ipEdit);
+
+        android.widget.EditText portEdit = new android.widget.EditText(this);
+        portEdit.setHint("Port");
+        portEdit.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
+        portEdit.setText(String.valueOf(port));
+        layout.addView(portEdit);
+
+        new android.app.AlertDialog.Builder(this)
+                .setTitle("MAVLink forwarding")
+                .setView(layout)
+                .setPositiveButton("OK", (dialog, which) -> {
+                    String newIp = ipEdit.getText().toString().trim();
+                    String portString = portEdit.getText().toString().trim();
+                    int newPort = 14550;
+                    if (!portString.isEmpty()) {
+                        try {
+                            newPort = Integer.parseInt(portString);
+                        } catch (NumberFormatException e) {
+                            Toast.makeText(this, "Invalid port, using 14550", Toast.LENGTH_SHORT).show();
+                        }
+                    }
+                    SharedPreferences.Editor editor = prefs.edit();
+                    editor.putString("mavlink_forward_ip", newIp);
+                    editor.putInt("mavlink_forward_port", newPort);
+                    editor.apply();
+                    applyMavlinkForwardingFromPrefs();
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    /**
      * Submenu for drone settings.
      */
     private void setupDroneSubMenu(PopupMenu popup) {
@@ -919,7 +1058,290 @@ public class VideoActivity extends AppCompatActivity implements IVideoParamsChan
      */
     private void setupMavlink() {
         MavlinkNative.nativeStart(this);
+        // UDP 转发暂时禁用：不要调用 applyMavlinkForwardingFromPrefs()
+        applyBluetoothForwardingFromPrefs();
         handler.post(runnable);
+    }
+
+    private void applyMavlinkForwardingFromPrefs() {
+        // UDP 转发暂时禁用：将任何配置归零，确保原生端不做 UDP 转发
+        MavlinkNative.nativeConfigureForward(new String[0], new int[0], false);
+    }
+
+    private void applyBluetoothForwardingFromPrefs() {
+        SharedPreferences prefs = getSharedPreferences("general", MODE_PRIVATE);
+        boolean enabled = prefs.getBoolean("mavlink_forward_bt_enabled", false);
+        if (!enabled) {
+            stopBluetoothForwarding();
+            return;
+        }
+        if (bluetoothForwarder == null) {
+            return;
+        }
+        if (!ensureBluetoothPermission()) {
+            pendingBluetoothPermission = true;
+            return;
+        }
+        BluetoothAdapter adapter = BluetoothAdapter.getDefaultAdapter();
+        if (adapter == null) {
+            Toast.makeText(this, "设备不支持蓝牙", Toast.LENGTH_SHORT).show();
+            prefs.edit().putBoolean("mavlink_forward_bt_enabled", false).apply();
+            return;
+        }
+        if (!adapter.isEnabled()) {
+            try {
+                startActivity(new Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE));
+            } catch (Exception ignored) {
+            }
+            Toast.makeText(this, "请开启蓝牙后重试", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        String address = prefs.getString("mavlink_forward_bt_device_address", "");
+        if (TextUtils.isEmpty(address)) {
+            Toast.makeText(this, "请选择蓝牙设备", Toast.LENGTH_SHORT).show();
+            showBluetoothDeviceDialog();
+            return;
+        }
+        // 强制 BLE-only
+        bluetoothForwarder.setPreferredMode(BluetoothForwarder.Mode.BLE);
+        bluetoothForwarder.connect(address, true);
+    }
+
+    private void stopBluetoothForwarding() {
+        bluetoothConnected = false;
+        bluetoothConnectedName = "";
+        bluetoothConnectedIsBle = false;
+        if (bluetoothForwarder != null) {
+            bluetoothForwarder.disconnect(false);
+        }
+        MavlinkNative.nativeSetRawForwarder(null);
+    }
+
+    private boolean ensureBluetoothPermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+                    ActivityCompat.requestPermissions(this, new String[]{Manifest.permission.ACCESS_FINE_LOCATION}, REQUEST_BLUETOOTH_PERMISSION);
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        ArrayList<String> request = new ArrayList<>();
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+            request.add(Manifest.permission.BLUETOOTH_CONNECT);
+        }
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
+            request.add(Manifest.permission.BLUETOOTH_SCAN);
+        }
+        if (!request.isEmpty()) {
+            ActivityCompat.requestPermissions(this, request.toArray(new String[0]), REQUEST_BLUETOOTH_PERMISSION);
+            return false;
+        }
+        return true;
+    }
+
+    private void showBluetoothDeviceDialog() {
+        BluetoothAdapter adapter = BluetoothAdapter.getDefaultAdapter();
+        if (adapter == null) {
+            Toast.makeText(this, "设备不支持蓝牙", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (!ensureBluetoothPermission()) {
+            return;
+        }
+        if (!adapter.isEnabled()) {
+            try {
+                startActivity(new Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE));
+            } catch (Exception ignored) {
+            }
+            Toast.makeText(this, "请开启蓝牙后再选择设备", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        final List<BluetoothDevice> devices = new ArrayList<>();
+        final java.util.Set<String> seenAddresses = new java.util.HashSet<>();
+        final ArrayAdapter<String> deviceAdapter = new ArrayAdapter<>(this, android.R.layout.simple_list_item_1);
+        final ListView listView = new ListView(this);
+        listView.setAdapter(deviceAdapter);
+
+        final Handler mainHandler = new Handler(Looper.getMainLooper());
+        final BluetoothLeScanner bleScanner = Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP ? adapter.getBluetoothLeScanner() : null;
+        final java.util.UUID nusUuid = java.util.UUID.fromString("6E400001-B5A3-F393-E0A9-E50E24DCCA9E");
+
+        final ScanCallback scanCallback = new ScanCallback() {
+            @Override
+            public void onScanResult(int callbackType, ScanResult result) {
+                BluetoothDevice device = result.getDevice();
+                if (device == null || device.getAddress() == null) {
+                    return;
+                }
+                if (!seenAddresses.add(device.getAddress())) {
+                    return;
+                }
+                devices.add(device);
+                String name = !TextUtils.isEmpty(device.getName()) ? device.getName() : "未知设备";
+                String label = name + " (" + device.getAddress() + ")";
+                mainHandler.post(() -> {
+                    deviceAdapter.add(label);
+                    deviceAdapter.notifyDataSetChanged();
+                });
+            }
+        };
+
+        final Runnable stopScanRunnable = () -> {
+            if (bleScanner != null) {
+                try {
+                    bleScanner.stopScan(scanCallback);
+                } catch (SecurityException ignored) {
+                }
+            }
+        };
+
+        final AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("选择蓝牙设备 (仅 BLE)")
+                .setView(listView)
+                .setNegativeButton("取消", (d, w) -> {})
+                .setNeutralButton("手动输入", (d, w) -> showManualBluetoothInputDialog())
+                .create();
+
+        listView.setOnItemClickListener((parent, view, position, id) -> {
+            stopScanRunnable.run();
+            dialog.dismiss();
+            BluetoothDevice device = devices.get(position);
+            SharedPreferences prefs = getSharedPreferences("general", MODE_PRIVATE);
+            prefs.edit()
+                    .putString("mavlink_forward_bt_device_address", device.getAddress())
+                    .putString("mavlink_forward_bt_device_name", device.getName())
+                    .apply();
+            if (prefs.getBoolean("mavlink_forward_bt_enabled", false)) {
+                applyBluetoothForwardingFromPrefs();
+            }
+        });
+
+        dialog.setOnDismissListener(d -> stopScanRunnable.run());
+        dialog.show();
+        // 仅扫描 BLE，不展示经典蓝牙已配对设备列表（SPP）
+
+        if (bleScanner != null) {
+            try {
+                java.util.List<ScanFilter> filters = Collections.singletonList(
+                        new ScanFilter.Builder().setServiceUuid(new ParcelUuid(nusUuid)).build()
+                );
+                ScanSettings settings = new ScanSettings.Builder()
+                        .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                        .build();
+                bleScanner.startScan(filters, settings, scanCallback);
+                mainHandler.postDelayed(stopScanRunnable, 8000);
+            } catch (SecurityException e) {
+                Log.e(TAG, "BLE scan begin failed", e);
+                stopScanRunnable.run();
+            }
+        } else {
+            Toast.makeText(this, "BLE 扫描不可用", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void showManualBluetoothInputDialog() {
+        EditText editText = new EditText(this);
+        editText.setHint("请输入设备 MAC 地址，例如 AA:BB:CC:DD:EE:FF");
+        new AlertDialog.Builder(this)
+                .setTitle("手动输入地址")
+                .setView(editText)
+                .setPositiveButton("确定", (dialog, which) -> {
+                    String input = editText.getText().toString().trim();
+                    if (TextUtils.isEmpty(input)) {
+                        Toast.makeText(this, "地址不能为空", Toast.LENGTH_SHORT).show();
+                        return;
+                    }
+                    SharedPreferences prefs = getSharedPreferences("general", MODE_PRIVATE);
+                    prefs.edit()
+                            .putString("mavlink_forward_bt_device_address", input)
+                            .putString("mavlink_forward_bt_device_name", input)
+                            .apply();
+                    if (prefs.getBoolean("mavlink_forward_bt_enabled", false)) {
+                        applyBluetoothForwardingFromPrefs();
+                    }
+                })
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
+    private String estimateBroadcastAddress() {
+        WifiManager wifiManager = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+        if (wifiManager != null) {
+            DhcpInfo dhcpInfo = wifiManager.getDhcpInfo();
+            if (dhcpInfo != null) {
+                int broadcast = (dhcpInfo.ipAddress & dhcpInfo.netmask) | ~dhcpInfo.netmask;
+                if (broadcast != 0 && broadcast != -1) {
+                    return Formatter.formatIpAddress(broadcast);
+                }
+            }
+        }
+        return "192.168.43.255";
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions,
+                                           @NonNull int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == REQUEST_BLUETOOTH_PERMISSION) {
+            pendingBluetoothPermission = false;
+            boolean granted = true;
+            for (int result : grantResults) {
+                if (result != PackageManager.PERMISSION_GRANTED) {
+                    granted = false;
+                    break;
+                }
+            }
+            if (granted) {
+                applyBluetoothForwardingFromPrefs();
+            } else {
+                SharedPreferences prefs = getSharedPreferences("general", MODE_PRIVATE);
+                prefs.edit().putBoolean("mavlink_forward_bt_enabled", false).apply();
+                stopBluetoothForwarding();
+                Toast.makeText(this, "蓝牙权限被拒绝", Toast.LENGTH_SHORT).show();
+            }
+        }
+    }
+
+    @Override
+    public void onConnected(String address, String name, boolean ble) {
+        runOnUiThread(() -> {
+            bluetoothConnected = true;
+            bluetoothConnectedName = !TextUtils.isEmpty(name) ? name : address;
+            bluetoothConnectedIsBle = ble;
+            MavlinkNative.nativeSetRawForwarder(bluetoothForwarder);
+            String mode = ble ? "BLE" : "SPP";
+            Toast.makeText(this, "蓝牙已连接(" + mode + "): " + bluetoothConnectedName, Toast.LENGTH_SHORT).show();
+        });
+    }
+
+    @Override
+    public void onConnectionFailed(String address, String message, boolean ble) {
+        runOnUiThread(() -> {
+            bluetoothConnected = false;
+            bluetoothConnectedName = "";
+            bluetoothConnectedIsBle = false;
+            MavlinkNative.nativeSetRawForwarder(null);
+            Toast.makeText(this, (ble ? "BLE" : "SPP") + "连接失败: " + (message != null ? message : ""), Toast.LENGTH_SHORT).show();
+        });
+    }
+
+    @Override
+    public void onDisconnected(String address, String message, boolean ble) {
+        runOnUiThread(() -> {
+            bluetoothConnected = false;
+            bluetoothConnectedName = "";
+            bluetoothConnectedIsBle = false;
+            MavlinkNative.nativeSetRawForwarder(null);
+            if (message != null && !message.isEmpty()) {
+                Toast.makeText(this, (ble ? "BLE" : "SPP") + " " + message, Toast.LENGTH_SHORT).show();
+            } else {
+                Toast.makeText(this, (ble ? "BLE" : "SPP") + " 蓝牙已断开", Toast.LENGTH_SHORT).show();
+            }
+        });
     }
 
     // ----------------------------------------------------------------------------
@@ -1521,5 +1943,15 @@ public class VideoActivity extends AppCompatActivity implements IVideoParamsChan
                 handler.proceed("root", "12345");
             }
         });
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        handler.removeCallbacks(runnable);
+        MavlinkNative.nativeSetRawForwarder(null);
+        if (bluetoothForwarder != null) {
+            bluetoothForwarder.release();
+        }
     }
 }
